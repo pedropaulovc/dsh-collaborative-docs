@@ -1,0 +1,3 @@
+- insert:
+    - id: collaborative-docs
+      name: '@pedropaulovc/dsh-collaborative-docs'
