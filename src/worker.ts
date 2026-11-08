@@ -17,6 +17,11 @@ function serializeError(error: unknown): ServiceError {
   return { name: error.name, message: error.message, stack: error.stack, code: details.code, status: details.status }
 }
 
+function getServer() {
+  return serverPromise ??= startServer({ ...config!, store: store! })
+    .catch(error => { serverPromise = undefined; throw error })
+}
+
 function shutdown() {
   return closing ??= (async () => {
     // All accepted operations settle before closing the listener and durable store.
@@ -52,11 +57,13 @@ async function execute(request: Exclude<ServiceRequest, { method: 'close' }>) {
     case 'reply': return documents.reply(...request.args)
     case 'resolve': return documents.resolve(...request.args)
     case 'exportMarkdown': return documents.exportMarkdown(...request.args)
+    case 'embed': {
+      return (await getServer()).embed(...request.args)
+    }
     case 'open': {
       const [id] = request.args
       if (id) await documents.read(id)
-      const server = await (serverPromise ??= startServer({ ...config!, store: documents })
-        .catch(error => { serverPromise = undefined; throw error }))
+      const server = await getServer()
       const url = new URL(server.url)
       if (id) url.searchParams.set('document', id)
       return { url: url.href }

@@ -57,6 +57,17 @@ h1 { font-size: clamp(1.45rem, 2vw, 2rem); line-height: 1.2; max-width: none; le
 .bn-editor p { max-width: none; }
 .bn-threads-sidebar { width: 100%; min-width: 0; padding: 0; background: var(--color-transparent); }
 .bn-thread { max-width: 100%; overflow-wrap: anywhere; }
+/* Native Mantine threads have a 350px minimum, wider than either sidebar.
+   Shrink the card and its start-aligned editor without clipping native controls. */
+.comments-panel .bn-threads-sidebar .bn-thread { width: 100%; min-width: 0; }
+.comments-panel :is(.bn-thread-comments, .bn-thread-composer, .bn-thread-comment, .bn-comment-editor) { min-width: 0; width: 100%; }
+.comments-panel .bn-thread-comment > .mantine-Group-root,
+.comments-panel .bn-thread-comment .mantine-Text-root { min-width: 0; max-width: 100%; }
+/* Native hover actions are absolutely positioned over the author. Give them
+   their own row so long names and narrow sidebars keep every action reachable. */
+.comments-panel .bn-thread-comment > .mantine-Group-root:has(.bn-comment-actions) { position: static !important; align-self: flex-end; }
+.comments-panel .bn-comment-actions { min-width: 0; max-width: 100%; flex-wrap: wrap; }
+.comments-panel .bn-comment-reactions { flex-wrap: wrap; }
 .notice { padding: var(--space-sm) var(--space-md); border: 1px solid var(--color-rule-2); background: var(--color-paper-2); border-radius: 6px; margin-bottom: var(--space-lg); display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); font-size: var(--text-sm); }
 .notice p { min-width: 0; overflow-wrap: anywhere; }
 .state-panel { max-width: 620px; padding: var(--space-2xl) 0; margin-inline: auto; }

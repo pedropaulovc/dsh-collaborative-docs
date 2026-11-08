@@ -77,14 +77,23 @@ export function apply(ctx: PluginContext, config: Config = {}) {
   // Exact Connection routes are owner-only in rc.3. Speak the RPC envelope so
   // the desktop IPC carrier works without a browser-relative fetch assumption.
   ctx.connection.fetch.register({
-    path: '/api/collaborative_docs_open', methods: ['POST'], requestBody: 'buffered',
+    path: '/api/collaborative_docs_embed', methods: ['POST'], requestBody: 'buffered',
     async fetch(request) {
       const raw = await request.text()
       if (raw.length > 4096) return new Response('Request too large', { status: 413 })
       let message: { type?: unknown; rpcId?: unknown; method?: unknown; payload?: unknown }
       try { message = JSON.parse(raw) } catch { return new Response('Invalid JSON', { status: 400 }) }
-      if (!message || message.type !== 'client-request' || typeof message.rpcId !== 'string' || message.rpcId.length > 200 || message.method !== 'collaborative_docs_open' || !message.payload || typeof message.payload !== 'object' || Array.isArray(message.payload) || Object.keys(message.payload).length) return new Response('Invalid request', { status: 400 })
-      const value = await open(request.signal)
+      if (!message || message.type !== 'client-request' || typeof message.rpcId !== 'string' || message.rpcId.length > 200 || message.method !== 'collaborative_docs_embed' || !message.payload || typeof message.payload !== 'object' || Array.isArray(message.payload)) return new Response('Invalid request', { status: 400 })
+      const payload = message.payload as Record<string, unknown>
+      if (Object.keys(payload).length !== 1 || typeof payload.parentOrigin !== 'string') return new Response('Invalid request', { status: 400 })
+      const parentOrigin = payload.parentOrigin
+      let value: { url: string }
+      try { value = await use(request.signal, store => store.embed(parentOrigin)) }
+      catch (error) {
+        const status = error && typeof error === 'object' && 'status' in error ? error.status : undefined
+        if (typeof status === 'number' && status >= 400 && status < 500) return new Response(error instanceof Error ? error.message : 'Invalid request', { status, headers: { 'Cache-Control': 'no-store' } })
+        throw error
+      }
       return Response.json({ type: 'server-response', rpcId: message.rpcId, result: { ok: true, value } }, { headers: { 'Cache-Control': 'no-store' } })
     },
   })

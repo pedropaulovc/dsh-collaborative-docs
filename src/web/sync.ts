@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
+import { workspaceUrl } from './urls.js';
 
 export type SyncState = {
   connection: 'connecting' | 'connected' | 'disconnected';
@@ -101,8 +102,8 @@ export class DocumentSync {
   private connect() {
     if (this.stopped || this.socket) return;
     this.publish({ connection: 'connecting' });
-    const url = new URL(`/sync/${encodeURIComponent(this.id)}`, location.href);
-    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = workspaceUrl(`sync/${encodeURIComponent(this.id)}`);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(url);
     this.socket = socket;
     this.handshakeTimer = window.setTimeout(() => socket.close(), 15000);

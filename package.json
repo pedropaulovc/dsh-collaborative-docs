@@ -1,6 +1,6 @@
 {
   "name": "@pedropaulovc/dsh-collaborative-docs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
   "description": "Local collaborative documents and comment threads for DeepSeek Harness",
   "type": "module",
@@ -25,6 +25,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
+    "pretest": "npm run build",
     "test": "tsx --test test/*.test.ts",
     "dev": "tsx src/dev.ts"
   },

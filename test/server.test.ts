@@ -26,8 +26,8 @@ async function navigationRequest(url: string, headers: Record<string, string>) {
   req.end()
   return result.promise
 }
-function peer(url: string, origin: string, cookie: string) {
-  const ws = new WebSocket(url, { origin, headers: { Cookie: cookie } })
+function peer(url: string, origin: string, cookie = '') {
+  const ws = new WebSocket(url, { origin, headers: cookie ? { Cookie: cookie } : {} })
   const frames: Frame[] = []
   const waiting: { resolve(value: Frame): void; reject(error: Error): void }[] = []
   ws.on('message', raw => {
@@ -43,9 +43,9 @@ function peer(url: string, origin: string, cookie: string) {
     return deferred.promise
   } }
 }
-async function refused(url: string, origin: string, cookie = '') {
+async function refused(url: string, origin: string, cookie = '', headers: Record<string, string> = {}) {
   const deferred = Promise.withResolvers<number>()
-  const ws = new WebSocket(url, { origin, headers: { Cookie: cookie } })
+  const ws = new WebSocket(url, { origin, headers: { Cookie: cookie, ...headers } })
   ws.on('unexpected-response', (_request, response) => { response.resume(); deferred.resolve(response.statusCode ?? 0); ws.terminate() })
   ws.on('open', () => { ws.terminate(); deferred.reject(new Error('Unauthorized WebSocket was accepted')) })
   ws.on('error', () => {})
@@ -96,6 +96,101 @@ test('capability bootstrap, strict HTTP/WS boundaries and bounded inputs', { tim
   // Neither encoded traversal nor filenames outside the public asset root are exposed.
   assert.ok([400, 404].includes((await fetch(`${origin}/%2e%2e%2fpackage.json`, { headers })).status))
   assert.equal((await fetch(`${origin}/package.json`, { headers })).status, 404)
+})
+
+test('embedded capabilities serve assets, API and sync without cookies and isolate local parents', { timeout: 30_000 }, async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'docs-embed-'))
+  const server = await startServer({ dataDir })
+  t.after(async () => { await server.close(); await rm(dataDir, { recursive: true, force: true }) })
+  const origin = new URL(server.url).origin
+  const desktop = server.embed('dsh-app://app').url
+  const web = server.embed('http://localhost:5173').url
+  assert.equal(server.embed('http://LOCALHOST:5173/').url, web)
+  assert.notEqual(desktop, web)
+  assert.match(new URL(desktop).pathname, /^\/embedded\/[A-Za-z0-9_-]{43}\/$/)
+  for (const parent of ['null', 'file:///app', 'data:text/html,x', 'https://remote.example', 'http://127.0.0.2', 'http://localhost.evil', 'http://user@localhost', 'http://localhost/path', 'http://localhost?x', 'http://localhost#x', 'dsh-app://other', 'dsh-app://app/']) {
+    assert.throws(() => server.embed(parent), /Invalid local parent origin/)
+  }
+  assert.ok(server.embed('https://[::1]:8443').url)
+  const navigation = { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'iframe' }
+  for (const [url, parent] of [[desktop, 'dsh-app://app'], [web, 'http://localhost:5173']]) {
+    const page = await navigationRequest(url, navigation)
+    assert.equal(page.status, 200)
+    assert.match(String(page.headers['content-type']), /text\/html/)
+    assert.ok(String(page.headers['content-security-policy']).includes(`frame-ancestors ${parent};`))
+    assert.equal(page.headers['x-frame-options'], undefined)
+    assert.equal(page.headers['set-cookie'], undefined)
+    assert.equal(page.headers.location, undefined)
+    assert.equal(page.headers['referrer-policy'], 'no-referrer')
+    assert.equal((await navigationRequest(url, { ...navigation, Origin: 'https://evil.example' })).status, 403)
+    const asset = await fetch(new URL('app.js', url))
+    assert.equal(asset.status, 200)
+    assert.match(asset.headers.get('content-type')!, /javascript/)
+    assert.equal(asset.headers.get('set-cookie'), null)
+    const api = new URL('api/documents', url)
+    assert.deepEqual(await (await fetch(api)).json(), [])
+    assert.equal((await navigationRequest(api.href, navigation)).status, 403)
+    assert.equal((await navigationRequest(api.href, { Host: 'evil.example' })).status, 403)
+    assert.equal((await fetch(api, { headers: { Origin: parent } })).status, 403)
+    for (const deniedOrigin of [undefined, parent, 'null']) {
+      assert.equal((await fetch(api, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(deniedOrigin ? { Origin: deniedOrigin } : {}) }, body: '{"title":"Denied"}' })).status, 403)
+    }
+  }
+  const headers = { Origin: origin, 'Content-Type': 'application/json' }
+  const createdResponse = await fetch(new URL('api/documents', desktop), { method: 'POST', headers, body: JSON.stringify({ title: 'Cookie-free', markdown: 'Imported paragraph' }) })
+  assert.equal(createdResponse.status, 200)
+  assert.equal(createdResponse.headers.get('set-cookie'), null)
+  const created = await createdResponse.json()
+  const sync = new URL(`sync/${created.id}`, desktop).href.replace('http:', 'ws:')
+  const client = peer(sync, origin)
+  t.after(() => client.ws.terminate())
+  assert.equal((await client.next()).type, 'sync')
+  const editedResponse = await fetch(new URL(`api/documents/${created.id}/edit`, desktop), { method: 'POST', headers, body: JSON.stringify({
+    expectedRevision: created.revision, operations: [{ type: 'replace_text', blockId: created.blocks[0].id, search: 'Imported', replacement: 'Edited' }],
+  }) })
+  assert.equal(editedResponse.status, 200)
+  const edited = await editedResponse.json()
+  assert.equal((await client.next()).revision, edited.revision)
+  assert.match(await (await fetch(new URL(`api/documents/${created.id}/markdown`, desktop))).text(), /Edited paragraph/)
+  assert.equal((await server.store.read(created.id)).revision, edited.revision)
+  assert.equal(await refused(sync, 'dsh-app://app'), 403)
+  assert.equal(await refused(sync, origin, '', { Host: 'evil.example' }), 403)
+  assert.equal(await refused(sync, origin, '', { 'Sec-Fetch-Site': 'cross-site' }), 403)
+  const unknown = `${origin}/embedded/${'x'.repeat(43)}/`
+  assert.equal((await fetch(unknown)).status, 401)
+  assert.equal((await fetch(new URL('api/documents', unknown))).status, 401)
+  assert.equal(await refused(new URL(`sync/${created.id}`, unknown).href.replace('http:', 'ws:'), origin), 401)
+  assert.equal((await fetch(desktop.slice(0, -1))).status, 401)
+  assert.equal((await fetch(`${origin}/api/documents`)).status, 401)
+  for (const path of ['%2e%2e%2fpackage.json', '%2e%2e/api/documents', 'a/%2e%2e/api/documents', '%5cpackage.json', '%00']) {
+    // A raw client is required: URL/Fetch normalize encoded dot segments.
+    const response = Promise.withResolvers<number>()
+    const req = request(origin, { path: new URL(desktop).pathname + path }, res => { res.resume(); response.resolve(res.statusCode!) })
+    req.on('error', response.reject); req.end()
+    assert.equal(await response.promise, 400)
+  }
+  const bootstrap = await fetch(server.url, { redirect: 'manual' })
+  const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+  const standalone = await fetch(origin, { headers: { Cookie: cookie } })
+  assert.equal(standalone.headers.get('x-frame-options'), 'DENY')
+  assert.match(standalone.headers.get('content-security-policy')!, /frame-ancestors 'none'/)
+  assert.equal((await fetch(unknown, { headers: { Cookie: cookie } })).status, 401)
+  for (let port = 6000; port < 6013; port++) server.embed(`http://127.0.0.1:${port}`)
+  assert.throws(() => server.embed('http://127.0.0.1:7000'), /Too many/)
+  assert.equal(server.embed('dsh-app://app').url, desktop)
+  const closed = Promise.withResolvers<void>()
+  client.ws.once('close', () => closed.resolve())
+  await server.close()
+  await closed.promise
+  assert.throws(() => server.embed('dsh-app://app'), /closing/)
+  await assert.rejects(fetch(new URL('api/documents', desktop)))
+  const replacement = await startServer({ dataDir })
+  try {
+    assert.equal((await replacement.store.read(created.id)).revision, edited.revision)
+    const stale = new URL(desktop).pathname
+    assert.equal((await fetch(new URL(stale, replacement.url))).status, 401)
+    assert.notEqual(new URL(replacement.embed('dsh-app://app').url).pathname, stale)
+  } finally { await replacement.close() }
 })
 
 test('durable agent broadcasts, two peer Yjs sync, stale edit rejection and restart', { timeout: 30_000 }, async t => {
@@ -161,14 +256,15 @@ test('durable agent broadcasts, two peer Yjs sync, stale edit rejection and rest
   assert.equal((await fetch(`${new URL(server.url).origin}/api/documents`, { headers: { Cookie: cookie } })).status, 401)
 })
 
-test('initial sync includes durable edits captured during the handshake before reporting saved', { timeout: 20_000 }, async t => {
+for (const embedded of [false, true]) test(`initial sync includes durable edits captured during the ${embedded ? 'embedded' : 'standalone'} handshake before reporting saved`, { timeout: 20_000 }, async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'docs-handshake-'))
   const server = await startServer({ dataDir })
   const release = Promise.withResolvers<void>()
   t.after(async () => { release.resolve(); await server.close(); await rm(dataDir, { recursive: true, force: true }) })
   const origin = new URL(server.url).origin
-  const bootstrap = await fetch(server.url, { redirect: 'manual' })
-  const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+  const bootstrap = embedded ? undefined : await fetch(server.url, { redirect: 'manual' })
+  const cookie = bootstrap?.headers.get('set-cookie')!.split(';')[0] ?? ''
+  const base = embedded ? server.embed('dsh-app://app').url : `${origin}/`
   const created = await server.store.create({ title: 'Handshake', markdown: 'before' })
   const captured = Promise.withResolvers<void>()
   const getSyncState = server.store.getSyncState.bind(server.store)
@@ -178,7 +274,7 @@ test('initial sync includes durable edits captured during the handshake before r
     await release.promise
     return state
   })
-  const client = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+  const client = peer(new URL(`sync/${created.id}`, base).href.replace('http:', 'ws:'), origin, cookie)
   const doc = new Y.Doc()
   t.after(() => { client.ws.terminate(); doc.destroy() })
   await captured.promise
@@ -218,8 +314,8 @@ test('initial sync includes durable edits captured during the handshake before r
   assert.equal(client.ws.readyState, WebSocket.OPEN)
 })
 
-for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
-  test(`pending initial sync cleans up on ${outcome}`, { timeout: 20_000 }, async t => {
+for (const embedded of [false, true]) for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
+  test(`${embedded ? 'embedded' : 'standalone'} pending initial sync cleans up on ${outcome}`, { timeout: 20_000 }, async t => {
     const dataDir = await mkdtemp(join(tmpdir(), 'docs-pending-sync-'))
     const store = new DocumentStore(dataDir)
     await store.init()
@@ -230,8 +326,9 @@ for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
     const release = Promise.withResolvers<void>()
     t.after(async () => { release.resolve(); await server.close(); await store.close(); await rm(dataDir, { recursive: true, force: true }) })
     const origin = new URL(server.url).origin
-    const bootstrap = await fetch(server.url, { redirect: 'manual' })
-    const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+    const bootstrap = embedded ? undefined : await fetch(server.url, { redirect: 'manual' })
+    const cookie = bootstrap?.headers.get('set-cookie')!.split(';')[0] ?? ''
+    const base = embedded ? server.embed('dsh-app://app').url : `${origin}/`
     const created = await store.create({ title: 'Pending', markdown: 'before' })
     const captured = Promise.withResolvers<void>()
     const getSyncState = store.getSyncState.bind(store)
@@ -241,7 +338,7 @@ for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
       await release.promise
       return state
     })
-    const client = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+    const client = peer(new URL(`sync/${created.id}`, base).href.replace('http:', 'ws:'), origin, cookie)
     t.after(() => client.ws.terminate())
     let opened = false
     client.ws.on('open', () => { opened = true })
@@ -263,22 +360,23 @@ for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
     capture.mock.restore()
     if (outcome !== 'shutdown') {
       // A new connection to the same document still receives a clean sync.
-      const retry = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+      const retry = peer(new URL(`sync/${created.id}`, base).href.replace('http:', 'ws:'), origin, cookie)
       t.after(() => retry.ws.terminate())
       assert.equal((await retry.next()).type, 'sync')
     }
   })
 }
 
-test('native comments merge over WebSocket and HTTP reply/resolve persist across restart', { timeout: 30_000 }, async t => {
+for (const embedded of [false, true]) test(`${embedded ? 'embedded' : 'standalone'} native comments merge over WebSocket and HTTP reply/resolve persist across restart`, { timeout: 30_000 }, async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'docs-comments-'))
   let server = await startServer({ dataDir })
   t.after(async () => { await server.close(); await rm(dataDir, { recursive: true, force: true }) })
   const origin = new URL(server.url).origin
-  const bootstrap = await fetch(server.url, { redirect: 'manual' })
-  const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+  const bootstrap = embedded ? undefined : await fetch(server.url, { redirect: 'manual' })
+  const cookie = bootstrap?.headers.get('set-cookie')!.split(';')[0] ?? ''
+  const base = embedded ? server.embed('dsh-app://app').url : `${origin}/`
   const created = await server.store.create({ title: 'Comments', markdown: 'Discuss this' })
-  const client = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+  const client = peer(new URL(`sync/${created.id}`, base).href.replace('http:', 'ws:'), origin, cookie)
   const doc = new Y.Doc()
   t.after(() => { client.ws.terminate(); doc.destroy() })
   const initial = await client.next()
@@ -289,18 +387,18 @@ test('native comments merge over WebSocket and HTTP reply/resolve persist across
   client.ws.send(JSON.stringify({ type: 'update', seq: 1, update: Buffer.from(Y.encodeStateAsUpdate(doc, vector)).toString('base64') }))
   assert.equal((await client.next()).type, 'update')
   assert.equal((await client.next()).type, 'ack')
-  const headers = { Cookie: cookie, Origin: origin, 'Content-Type': 'application/json' }
-  const replied = await fetch(`${origin}/api/documents/${created.id}/comments/${thread.id}/reply`, { method: 'POST', headers, body: JSON.stringify({ text: 'Agent answer' }) })
+  const headers = { ...(cookie ? { Cookie: cookie } : {}), Origin: origin, 'Content-Type': 'application/json' }
+  const replied = await fetch(new URL(`api/documents/${created.id}/comments/${thread.id}/reply`, base), { method: 'POST', headers, body: JSON.stringify({ text: 'Agent answer' }) })
   assert.equal(replied.status, 200)
   const replyUpdate = await client.next()
   assert.equal(replyUpdate.type, 'update')
   Y.applyUpdate(doc, Buffer.from(replyUpdate.update!, 'base64'))
   assert.equal(native.getThreads().get(thread.id)?.comments.length, 2)
-  assert.equal((await fetch(`${origin}/api/documents/${created.id}/comments/${thread.id}/resolve`, { method: 'POST', headers, body: JSON.stringify({ state: 'resolved' }) })).status, 200)
+  assert.equal((await fetch(new URL(`api/documents/${created.id}/comments/${thread.id}/resolve`, base), { method: 'POST', headers, body: JSON.stringify({ state: 'resolved' }) })).status, 200)
   const resolvedUpdate = await client.next()
   Y.applyUpdate(doc, Buffer.from(resolvedUpdate.update!, 'base64'))
   assert.equal(native.getThreads().get(thread.id)?.resolved, true)
-  assert.equal((await fetch(`${origin}/api/documents/${created.id}/comments/${thread.id}/resolve`, { method: 'POST', headers, body: JSON.stringify({ state: 'invalid' }) })).status, 400)
+  assert.equal((await fetch(new URL(`api/documents/${created.id}/comments/${thread.id}/resolve`, base), { method: 'POST', headers, body: JSON.stringify({ state: 'invalid' }) })).status, 400)
   await server.close()
   server = await startServer({ dataDir })
   const restored = await server.store.read(created.id)
