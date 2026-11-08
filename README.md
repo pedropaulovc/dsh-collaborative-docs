@@ -52,7 +52,7 @@ Create a document or import a Markdown file. Select text to add a comment, reply
 
 The agent reads a snapshot containing block IDs and a revision. An edit must include that revision and target specific blocks. Stale revisions are rejected so the agent can read the current document before trying again. This check covers changes already received by the server; edits still in flight can subsequently merge through Yjs.
 
-Markdown import creates a new document. Export produces a Markdown copy; comment threads and rich formatting that Markdown cannot represent remain in the local Yjs document. Editing an exported file does not update the shared document.
+Markdown import creates a new document. Export produces a Markdown copy; in Desktop, choose a destination in the native Save dialog. Comment threads and rich formatting that Markdown cannot represent remain in the local Yjs document. Editing an exported file does not update the shared document.
 
 ### Agent tools
 
