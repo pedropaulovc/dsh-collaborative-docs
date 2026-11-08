@@ -89,7 +89,15 @@ export async function startServer(options: { dataDir: string; port?: number; sto
     const message = { type: 'update', update: Buffer.from(update).toString('base64'), revision }
     for (const ws of sockets.get(id) ?? []) send(ws, message)
   })
-  const server = http.createServer((req, res) => { void handle(req, res) })
+  const requests = new Set<Promise<void>>()
+  const server = http.createServer((req, res) => {
+    const request = handle(req, res)
+    requests.add(request)
+    void request.then(
+      () => { requests.delete(request) },
+      error => { requests.delete(request); res.destroy(error instanceof Error ? error : new Error(String(error))) },
+    )
+  })
   server.requestTimeout = 15_000
   server.headersTimeout = 10_000
   server.maxHeadersCount = 64
@@ -237,14 +245,17 @@ export async function startServer(options: { dataDir: string; port?: number; sto
     close() {
       return closing ??= (async () => {
         unsubscribe()
+        const httpClosed = Promise.withResolvers<void>()
+        server.close(error => error ? httpClosed.reject(error) : httpClosed.resolve())
+        // Abort incomplete bodies instead of waiting past the child shutdown deadline.
+        // Upgraded WebSockets are not covered by closeAllConnections.
+        server.closeAllConnections()
         for (const peers of sockets.values()) for (const ws of peers) ws.terminate()
         const wsClosed = Promise.withResolvers<void>()
         wss.close(() => wsClosed.resolve())
-        await wsClosed.promise
-        const httpClosed = Promise.withResolvers<void>()
-        server.close(error => error ? httpClosed.reject(error) : httpClosed.resolve())
-        server.closeIdleConnections()
-        await httpClosed.promise
+        await Promise.all([httpClosed.promise, wsClosed.promise])
+        // A disconnected HTTP response must not abandon an accepted durable edit.
+        await Promise.allSettled(requests)
         if (!options.store) await store.close()
       })()
     },

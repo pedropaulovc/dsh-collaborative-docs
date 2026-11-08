@@ -6,7 +6,7 @@ await rm('dist', { recursive: true, force: true });
 await mkdir('dist/web', { recursive: true });
 await Promise.all([
   build({
-    entryPoints: ['src/index.ts', 'src/dev.ts'],
+    entryPoints: ['src/index.ts', 'src/dev.ts', 'src/worker.ts'],
     outdir: 'dist',
     bundle: true,
     packages: 'external',

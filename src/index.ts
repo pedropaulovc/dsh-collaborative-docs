@@ -2,8 +2,8 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { DocumentStore, type EditRequest } from './engine.js'
-import { startServer, type LocalDocumentServer } from './server.js'
+import type { EditRequest } from './engine.js'
+import { DocumentService } from './host-client.js'
 
 export const name = '@pedropaulovc/dsh-collaborative-docs'
 export const inject = ['tools', 'connection']
@@ -28,13 +28,12 @@ async function cancellable<T>(signal: AbortSignal, work: () => Promise<T>): Prom
 
 export function apply(ctx: PluginContext, config: Config = {}) {
   const dataDir = config.dataDir ?? join(homedir(), '.dsh', 'collaborative-docs')
-  let storePromise: Promise<DocumentStore> | undefined
-  let serverPromise: Promise<LocalDocumentServer> | undefined
+  let storePromise: Promise<DocumentService> | undefined
   let disposed = false
   const getStore = () => {
     if (disposed) throw new Error('Documents plugin has been disposed')
     return storePromise ??= (async () => {
-      const store = new DocumentStore(dataDir)
+      const store = new DocumentService({ dataDir, port: config.port })
       try { await store.init(); return store }
       catch (error) {
         try { await store.close() }
@@ -43,38 +42,16 @@ export function apply(ctx: PluginContext, config: Config = {}) {
       }
     })().catch(error => { storePromise = undefined; throw error })
   }
-  const getServer = () => {
-    if (disposed) throw new Error('Documents plugin has been disposed')
-    return serverPromise ??= getStore()
-      .then(store => startServer({ dataDir, port: config.port, store }))
-      .catch(error => { serverPromise = undefined; throw error })
-  }
-  const use = <T>(signal: AbortSignal, operation: (store: DocumentStore) => Promise<T>) => cancellable(signal, async () => {
+  const use = <T>(signal: AbortSignal, operation: (store: DocumentService) => Promise<T>) => cancellable(signal, async () => {
     const store = await getStore(); signal.throwIfAborted(); return await operation(store) as T & Json
   })
-  const open = (signal: AbortSignal, documentId?: string) => cancellable(signal, async () => {
-    if (documentId) { const store = await getStore(); signal.throwIfAborted(); await store.read(documentId) }
-    signal.throwIfAborted()
-    const server = await getServer()
-    const url = new URL(server.url)
-    if (documentId) url.searchParams.set('document', documentId)
-    return { url: url.href }
-  })
+  const open = (signal: AbortSignal, documentId?: string) => use(signal, store => store.open(documentId))
   ctx.effect(() => async () => {
     disposed = true
-    const errors: unknown[] = []
-    // Startup errors were already returned to the opener. A failed bind must
-    // not skip disposal of the independently owned document store.
-    const server = await serverPromise?.catch(() => undefined)
-    if (server) {
-      try { await server.close() } catch (error) { errors.push(error) }
-    }
+    // The child drains accepted edits before closing its listener and durable store.
     const store = await storePromise?.catch(() => undefined)
-    if (store) {
-      try { await store.close() } catch (error) { errors.push(error) }
-    }
-    if (errors.length) throw new AggregateError(errors, 'Documents cleanup failed')
-  }, 'collaborative-docs: local store and server')
+    if (store) await store.close()
+  }, 'collaborative-docs: isolated document service')
 
   ctx.tools.register(defineTool({ name: 'docs_open', description: 'Open the local collaborative document editor. The returned URL is a private bootstrap capability; share only with the owner.', parameters: { id: { type: 'string', description: 'Optional document UUID to select.' } }, output, execute: (args, exec) => open(exec.signal, args.id) }))
   ctx.tools.register(defineTool({ name: 'docs_list', description: 'List local collaborative documents.', parameters: {}, output, execute: (_args, exec) => use(exec.signal, store => store.list()) }))

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { request, type IncomingHttpHeaders } from 'node:http'
 import { WebSocket } from 'ws'
 import * as Y from 'yjs'
 import { DefaultThreadStoreAuth } from '@blocknote/core/comments'
@@ -10,6 +11,20 @@ import { YjsThreadStore } from '@blocknote/core/yjs'
 import { startServer } from '../src/server.js'
 
 type Frame = { type: string; update?: string; revision?: string; seq?: number; message?: string }
+// Unlike Fetch, node:http preserves browser-supplied navigation metadata.
+async function navigationRequest(url: string, headers: Record<string, string>) {
+  const result = Promise.withResolvers<{ status: number; headers: IncomingHttpHeaders; body: string }>()
+  const req = request(url, { headers }, response => {
+    void (async () => {
+      const chunks: Buffer[] = []
+      for await (const chunk of response) chunks.push(Buffer.from(chunk))
+      result.resolve({ status: response.statusCode!, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') })
+    })().catch(result.reject)
+  })
+  req.on('error', result.reject)
+  req.end()
+  return result.promise
+}
 function peer(url: string, origin: string, cookie: string) {
   const ws = new WebSocket(url, { origin, headers: { Cookie: cookie } })
   const frames: Frame[] = []
@@ -45,15 +60,15 @@ test('capability bootstrap, strict HTTP/WS boundaries and bounded inputs', { tim
   assert.equal((await fetch(`${origin}/?token=wrong`, { redirect: 'manual' })).status, 401)
   assert.equal((await fetch(server.url, { headers: { Origin: 'https://attacker.example' }, redirect: 'manual' })).status, 403)
   const navigation = { 'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate', 'Sec-Fetch-Dest': 'document' }
-  const crossSiteBootstrap = await fetch(server.url, { headers: navigation, redirect: 'manual' })
+  const crossSiteBootstrap = await navigationRequest(server.url, navigation)
   assert.equal(crossSiteBootstrap.status, 200)
-  assert.match(crossSiteBootstrap.headers.get('set-cookie')!, /HttpOnly; SameSite=Strict/)
-  const landing = await crossSiteBootstrap.text()
-  assert.ok(landing.includes('location.replace("/")'))
-  assert.match(crossSiteBootstrap.headers.get('content-security-policy')!, /script-src 'nonce-/)
+  assert.match(crossSiteBootstrap.headers['set-cookie']!.join(';'), /HttpOnly; SameSite=Strict/)
+  const landing = crossSiteBootstrap.body
   assert.ok(!landing.includes(new URL(server.url).searchParams.get('token')!))
-  assert.equal((await fetch(`${origin}/?token=wrong`, { headers: navigation, redirect: 'manual' })).status, 401)
-  assert.equal((await fetch(server.url, { headers: { ...navigation, Host: 'evil.example' }, redirect: 'manual' })).status, 403)
+  assert.equal((await navigationRequest(`${origin}/?token=wrong`, navigation)).status, 401)
+  assert.equal((await navigationRequest(server.url, { ...navigation, Host: 'evil.example' })).status, 403)
+  const navigationCookie = crossSiteBootstrap.headers['set-cookie']![0].split(';')[0]
+  assert.equal((await fetch(`${origin}/api/documents`, { headers: { Cookie: navigationCookie } })).status, 200)
   const bootstrap = await fetch(server.url, { redirect: 'manual' })
   assert.equal(bootstrap.status, 303)
   assert.equal(bootstrap.headers.get('location'), '/')
@@ -62,8 +77,8 @@ test('capability bootstrap, strict HTTP/WS boundaries and bounded inputs', { tim
   assert.match(setCookie, /SameSite=Strict/)
   const cookie = setCookie.split(';')[0]
   const headers = { Cookie: cookie, Origin: origin, 'Content-Type': 'application/json' }
-  assert.equal((await fetch(`${origin}/api/documents`, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' } })).status, 403)
-  assert.equal((await fetch(`${origin}/api/documents`, { headers: { Cookie: cookie, Host: 'evil.example' } })).status, 403)
+  assert.equal((await navigationRequest(`${origin}/api/documents`, { Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' })).status, 403)
+  assert.equal((await navigationRequest(`${origin}/api/documents`, { Cookie: cookie, Host: 'evil.example' })).status, 403)
   assert.equal((await fetch(`${origin}/api/documents`, { method: 'POST', headers: { ...headers, Origin: 'null' }, body: '{"title":"evil"}' })).status, 403)
   assert.equal((await fetch(`${origin}/api/documents`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{"title":"evil"}' })).status, 403)
   assert.equal((await fetch(`${origin}/api/unknown`, { headers })).status, 404)

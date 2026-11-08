@@ -1,9 +1,13 @@
-import React, { Component, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import React, { Component, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createUserStore } from '@blocknote/core';
+import type { UserStore } from '@blocknote/core';
+import type { ThreadData } from '@blocknote/core/comments';
 import { CommentsExtension, DefaultThreadStoreAuth } from '@blocknote/core/comments';
 import { withCollaboration, YjsThreadStore } from '@blocknote/core/yjs';
 import { BlockNoteView } from '@blocknote/mantine';
-import { BlockNoteViewEditor, ThreadsSidebar, useCreateBlockNote } from '@blocknote/react';
+import { BlockNoteViewEditor, ComponentsContext, ThreadsSidebar, useComponentsContext, useCreateBlockNote } from '@blocknote/react';
+import type { ComponentProps as BlockNoteComponentProps } from '@blocknote/react';
 import { DocumentSync } from './sync.js';
 import '@blocknote/mantine/style.css';
 import './app.css';
@@ -35,22 +39,83 @@ class EditorBoundary extends Component<{ children: React.ReactNode }, { error: s
   }
 }
 
-function RichEditor({ session, userId }: { session: Session; userId: string }) {
+function AccessibleNativeControls({ children }: { children: React.ReactNode }) {
+  const components = useComponentsContext();
+  const accessibleComponents = useMemo(() => {
+    if (!components) return undefined;
+    type ButtonProps = BlockNoteComponentProps['Generic']['Toolbar']['Button'];
+    // The Mantine implementation forwards this ref to its actual button.
+    const NativeButton = components.Generic.Toolbar.Button as React.ComponentType<ButtonProps & React.RefAttributes<HTMLButtonElement>>;
+    const Button = React.forwardRef<HTMLButtonElement, ButtonProps>((props, ref) => {
+      const label = props.label ?? props.mainTooltip;
+      if (label) return <NativeButton {...props} label={label} ref={ref} />;
+      return <NativeButton {...props} ref={ref} />;
+    });
+    Button.displayName = 'AccessibleNativeToolbarButton';
+    return {
+      ...components,
+      Generic: {
+        ...components.Generic,
+        Toolbar: { ...components.Generic.Toolbar, Button },
+      },
+    };
+  }, [components]);
+  return <ComponentsContext.Provider value={accessibleComponents}>{children}</ComponentsContext.Provider>;
+}
+
+type EditorResources = { threadStore: YjsThreadStore; userStore: UserStore };
+
+function PreparedEditor({ session, userId }: { session: Session; userId: string }) {
+  const [resources, setResources] = useState<EditorResources | null>(null);
+  useEffect(() => {
+    const userStore = createUserStore(async (ids, store) => {
+      const users = ids.map((id) => ({ id, username: id === 'agent' ? 'Agent' : id === userId ? 'You' : 'Collaborator', avatarUrl: '' }));
+      // All identities are local. Populate synchronously, before the resolver's
+      // promise settles: native resolved-thread rendering requires a cached user.
+      store.setUser(users);
+      return users;
+    });
+    const threadStore = new YjsThreadStore(userId, session.sync.doc.getMap('threads'), new DefaultThreadStoreAuth(userId, 'editor'));
+    const cacheThreadUsers = (threads: Map<string, ThreadData>) => {
+      const ids = new Set([userId, 'agent']);
+      for (const thread of threads.values()) {
+        if (thread.resolvedBy) ids.add(thread.resolvedBy);
+        for (const comment of thread.comments) {
+          ids.add(comment.userId);
+          for (const reaction of comment.reactions) {
+            for (const id of reaction.userIds) ids.add(id);
+          }
+        }
+      }
+      void userStore.loadUsers([...ids]);
+    };
+    cacheThreadUsers(threadStore.getThreads());
+    // Register before mounting the native UI, so newly received resolver IDs
+    // enter its shared cache before the sidebar's own thread subscription runs.
+    const unsubscribe = threadStore.subscribe(cacheThreadUsers);
+    setResources({ threadStore, userStore });
+    return unsubscribe;
+  }, [session, userId]);
+  if (!resources) return <p role="status">Loading comment authors…</p>;
+  return <RichEditor session={session} userId={userId} resources={resources} />;
+}
+
+function RichEditor({ session, userId, resources }: { session: Session; userId: string; resources: EditorResources }) {
   const [filter, setFilter] = useState<'open' | 'resolved' | 'all'>('open');
   const [commentsVisible, setCommentsVisible] = useState(true);
   const [hasSelection, setHasSelection] = useState(false);
   const [threadCount, setThreadCount] = useState(session.sync.doc.getMap('threads').size);
   const editor = useCreateBlockNote(withCollaboration({
     extensions: [CommentsExtension({
-      threadStore: new YjsThreadStore(userId, session.sync.doc.getMap('threads'), new DefaultThreadStoreAuth(userId, 'editor')),
-      resolveUsers: async (ids) => ids.map((id) => ({ id, username: id === 'agent' ? 'Agent' : id === userId ? 'You' : 'Collaborator', avatarUrl: '' })),
+      threadStore: resources.threadStore,
+      resolveUsers: resources.userStore,
     })],
     collaboration: {
       fragment: session.sync.doc.getXmlFragment('blocknote'),
       user: { name: 'Collaborator', color: getComputedStyle(document.documentElement).getPropertyValue('--color-accent').trim() },
       provider: session.sync,
     },
-  }), [session, userId]);
+  }), [session, userId, resources]);
   useEffect(() => {
     const threads = session.sync.doc.getMap('threads');
     const onThreads = () => setThreadCount(threads.size);
@@ -69,6 +134,7 @@ function RichEditor({ session, userId }: { session: Session; userId: string }) {
       </div>
     </div>
     <BlockNoteView editor={editor} theme="light" renderEditor={false} onSelectionChange={() => setHasSelection(Boolean(editor.getSelectedText()))}>
+      <AccessibleNativeControls>
       <div className={`editor-layout${commentsVisible ? '' : ' comments-hidden'}`}>
         <section className="document-paper" aria-label="Document editor"><BlockNoteViewEditor /></section>
         {commentsVisible && <aside id="comments-sidebar" className="comments-panel" aria-label="Document comments">
@@ -77,6 +143,7 @@ function RichEditor({ session, userId }: { session: Session; userId: string }) {
           <ThreadsSidebar filter={filter} sort="position" />
         </aside>}
       </div>
+      </AccessibleNativeControls>
     </BlockNoteView>
   </>;
 }
@@ -91,7 +158,7 @@ function OpenDocument({ session, userId }: { session: Session; userId: string })
       </div>
     </header>
     {sync.error && <div className="notice" role="alert"><p>{sync.error}</p><button type="button" onClick={session.sync.reconnect}>Retry connection</button></div>}
-    {sync.readiness === 'loading' ? <section className="state-panel" role="status"><h2>Opening document</h2><p>Waiting for the server before starting the editor.</p></section> : <EditorBoundary><RichEditor session={session} userId={userId} /></EditorBoundary>}
+    {sync.readiness === 'loading' ? <section className="state-panel" role="status"><h2>Opening document</h2><p>Waiting for the server before starting the editor.</p></section> : <EditorBoundary><PreparedEditor session={session} userId={userId} /></EditorBoundary>}
   </>;
 }
 

@@ -11,10 +11,19 @@ import { DocumentError, DocumentStore, type Block } from '../src/engine.js';
 
 async function fixture(t: TestContext) {
   const dir = await mkdtemp(join(tmpdir(), 'collaborative-engine-'));
-  const store = new DocumentStore(dir);
+  const stores: DocumentStore[] = [];
+  const makeStore = () => {
+    const next = new DocumentStore(dir);
+    stores.push(next);
+    return next;
+  };
+  const store = makeStore();
   await store.init();
-  t.after(async () => { await store.close(); await rm(dir, { recursive: true, force: true }); });
-  return { dir, store };
+  t.after(async () => {
+    for (const owned of stores) await owned.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  return { dir, store, makeStore };
 }
 function clientClone(doc: Y.Doc): Y.Doc {
   const client = new Y.Doc();
@@ -39,15 +48,14 @@ function plain(block: Block): string {
 }
 
 test('imports and exports native Markdown, persists authoritative binary through restart', async t => {
-  const { dir, store } = await fixture(t);
+  const { dir, store, makeStore } = await fixture(t);
   const created = await store.create({ title: 'Guide', markdown: '# Heading\n\nA **bold** paragraph' });
   assert.equal(created.blocks[0].type, 'heading');
   assert.equal(plain(created.blocks[1]), 'A bold paragraph');
   assert.match(await store.exportMarkdown(created.id), /\*\*bold\*\*/);
   const encoded = Y.encodeStateAsUpdate(await store.getDoc(created.id));
   await store.close();
-  const recovered = new DocumentStore(dir);
-  t.after(() => recovered.close());
+  const recovered = makeStore();
   await recovered.init();
   assert.deepEqual(await recovered.read(created.id), created);
   assert.deepEqual(Y.encodeStateAsUpdate(await recovered.getDoc(created.id)), encoded);
@@ -146,7 +154,7 @@ test('browser updates serialize before agent CAS; concurrent clients converge', 
 });
 
 test('native thread reply and resolve/reopen survive recovery; events observe durable bytes', async t => {
-  const { dir, store } = await fixture(t);
+  const { dir, store, makeStore } = await fixture(t);
   const created = await store.create({ title: 'Comments', markdown: 'Review me' });
   const doc = await store.getDoc(created.id);
   const client = clientClone(doc);
@@ -182,16 +190,14 @@ test('native thread reply and resolve/reopen survive recovery; events observe du
   await Promise.all(durableChecks);
   assert.equal(durableChecks.length, 4);
   await store.close();
-  const recovered = new DocumentStore(dir);
-  t.after(() => recovered.close());
+  const recovered = makeStore();
   await recovered.init();
   assert.deepEqual(await recovered.read(created.id), reopened);
 });
 
 test('a second store cannot write the same directory', async t => {
-  const { dir, store } = await fixture(t);
-  const second = new DocumentStore(dir);
-  t.after(() => second.close());
+  const { store, makeStore } = await fixture(t);
+  const second = makeStore();
   await assert.rejects(second.init(), (error: unknown) => error instanceof DocumentError && error.code === 'STORE_LOCKED');
   const created = await store.create({ title: 'Single writer', markdown: 'Safe' });
   assert.equal((await store.read(created.id)).title, 'Single writer');
@@ -218,13 +224,12 @@ test('invalid browser updates cannot poison authoritative state or emit persiste
 });
 
 test('corrupted persisted state fails closed rather than resetting documents', async t => {
-  const { dir, store } = await fixture(t);
+  const { dir, store, makeStore } = await fixture(t);
   const created = await store.create({ title: 'Must not disappear', markdown: 'Persisted' });
   await store.close();
   const file = join(dir, `${created.id}.json`);
   await writeFile(file, '{broken');
-  const recovered = new DocumentStore(dir);
-  t.after(() => recovered.close());
+  const recovered = makeStore();
   await assert.rejects(recovered.init(), (error: unknown) => error instanceof DocumentError && error.code === 'CORRUPT_STORAGE');
   assert.equal(await readFile(file, 'utf8'), '{broken');
 });
@@ -250,7 +255,7 @@ test('initial sync bytes and revision are captured atomically after preceding du
 });
 
 test('oversized thread replies reject before mutation, notification or persistence', async t => {
-  const { dir, store } = await fixture(t);
+  const { dir, store, makeStore } = await fixture(t);
   const created = await store.create({ title: 'Comment size boundary', markdown: 'Review' });
   const doc = await store.getDoc(created.id);
   const client = clientClone(doc);
@@ -274,8 +279,7 @@ test('oversized thread replies reject before mutation, notification or persisten
   // A failed oversized operation does not poison the queue; a small native resolution still works.
   assert.equal((await store.resolve(created.id, thread.id, 'resolved')).threads[0].resolved, true);
   await store.close();
-  const recovered = new DocumentStore(dir);
-  t.after(() => recovered.close());
+  const recovered = makeStore();
   await recovered.init();
   const snapshot = await recovered.read(created.id);
   assert.equal(snapshot.threads[0].comments.length, 1);
@@ -283,7 +287,7 @@ test('oversized thread replies reject before mutation, notification or persisten
 });
 
 test('malformed native comment bodies are rejected without poisoning valid threads; tombstones recover', async t => {
-  const { dir, store } = await fixture(t);
+  const { dir, store, makeStore } = await fixture(t);
   const created = await store.create({ title: 'Comment schema', markdown: 'Review' });
   const doc = await store.getDoc(created.id);
   const author = clientClone(doc);
@@ -319,10 +323,38 @@ test('malformed native comment bodies are rejected without poisoning valid threa
   await native.deleteComment({ threadId: thread.id, commentId: thread.comments[0].id, softDelete: true });
   await store.applyUpdate(created.id, Y.encodeStateAsUpdate(author, Y.encodeStateVector(doc)));
   await store.close();
-  const recovered = new DocumentStore(dir);
-  t.after(() => recovered.close());
+  const recovered = makeStore();
   await recovered.init();
   const recoveredThread = (await recovered.read(created.id)).threads[0];
   assert.equal(recoveredThread.comments[0].body, undefined);
   assert.ok(recoveredThread.comments[0].deletedAt instanceof Date);
+});
+
+test('deleting the final block rejects atomically, while replacing the final block in a batch is valid', async t => {
+  const { dir, store, makeStore } = await fixture(t);
+  const created = await store.create({ title: 'Last block', markdown: 'Only block' });
+  const before = await store.getSyncState(created.id);
+  const diskBefore = await readFile(join(dir, `${created.id}.json`));
+  let notifications = 0;
+  store.onUpdate(() => notifications++);
+  await assert.rejects(store.edit(created.id, {
+    expectedRevision: created.revision,
+    operations: [{ type: 'delete_block', blockId: created.blocks[0].id }],
+  }), /Document must contain at least one block/);
+  assert.deepEqual(await store.getSyncState(created.id), before);
+  assert.deepEqual(await readFile(join(dir, `${created.id}.json`)), diskBefore);
+  assert.equal(notifications, 0);
+  const replacement = await store.edit(created.id, {
+    expectedRevision: created.revision,
+    operations: [
+      { type: 'insert_after', blockId: created.blocks[0].id, markdown: 'Replacement block' },
+      { type: 'delete_block', blockId: created.blocks[0].id },
+    ],
+  });
+  assert.equal(replacement.blocks.length, 1);
+  assert.equal(plain(replacement.blocks[0]), 'Replacement block');
+  await store.close();
+  const recovered = makeStore();
+  await recovered.init();
+  assert.deepEqual(await recovered.read(created.id), replacement);
 });

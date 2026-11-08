@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, open, unlink, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import * as Y from 'yjs';
 import type { Block } from '@blocknote/core';
 import { CommentsExtension, DefaultThreadStoreAuth, type ThreadData } from '@blocknote/core/comments';
@@ -17,7 +18,7 @@ export type EditOperation =
   | { type: 'delete_block'; blockId: string };
 export interface EditRequest { expectedRevision: string; operations: EditOperation[] }
 export class DocumentError extends Error {
-  constructor(public readonly status: number, message: string, public readonly code = 'DOCUMENT_ERROR') { super(message); }
+  constructor(public readonly status: number, message: string, public readonly code = 'DOCUMENT_ERROR', cause?: unknown) { super(message, { cause }); }
 }
 interface Entry { info: DocumentInfo; doc: Y.Doc }
 type UpdateListener = (id: string, update: Uint8Array, revision: string) => void;
@@ -172,6 +173,7 @@ export class DocumentStore {
   private validate(doc: Y.Doc): void {
     if ([...doc.share.keys()].some(key => key !== 'blocknote' && key !== 'threads')) invalid('Unknown shared document root');
     const blocks = this.converter.yDocToBlocks(doc, 'blocknote');
+    if (blocks.length === 0) invalid('Document must contain at least one block; replace its text instead of deleting the final block');
     const ids = new Set<string>();
     const visit = (items: Block[]) => { for (const block of items) { if (!block.id || ids.has(block.id)) invalid('Missing or duplicate block ID'); ids.add(block.id); visit(block.children); } };
     visit(blocks);
@@ -204,12 +206,23 @@ export class DocumentStore {
       const file = await open(temporary, 'wx');
       try { await file.writeFile(JSON.stringify({ version: 1, ...entry.info, state: Buffer.from(state).toString('base64') })); await file.sync(); }
       finally { await file.close(); }
-      await rename(temporary, destination);
+      // Windows replacement can transiently fail while a reader/virus scanner holds the destination.
+      // Keep the old file intact and retry only the atomic rename, never unlink-then-replace.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rename(temporary, destination);
+          break;
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || attempt >= 6) throw error;
+          await delay(10 * 2 ** attempt);
+        }
+      }
       await this.syncDirectory();
     } catch (error) {
       await unlink(temporary).catch(() => {});
       this.fault = error;
-      throw new DocumentError(503, 'Failed to persist document; storage requires recovery');
+      throw new DocumentError(503, 'Failed to persist document; storage requires recovery', 'PERSISTENCE_FAILED', error);
     }
   }
   private async publish(entry: Entry, before: Uint8Array): Promise<DocumentSnapshot> {

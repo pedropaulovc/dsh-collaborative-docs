@@ -26,7 +26,7 @@ Fully quit Desktop, then install the tarball produced by `npm pack`:
 dsh plugin --profile desktop add /absolute/path/to/pedropaulovc-dsh-collaborative-docs-0.1.0.tgz
 ```
 
-Reopen Desktop. Open the Collaborative Docs panel, or ask the agent to call `docs_open`. Do not grant a compatibility exemption to get past an unsupported runtime version.
+Reopen Desktop. Open the Documents panel, or ask the agent to call `docs_open`. Do not grant a compatibility exemption to get past an unsupported runtime version.
 
 For the CLI web profile, use `--profile web` instead of `--profile desktop`.
 
@@ -82,7 +82,7 @@ npm test
 npm run build
 ```
 
-The engine owns document state and persistence. The transport provides the local HTTP/WebSocket service. The DSH adapter registers agent tools and manages the service lifetime; the browser UI edits the same Yjs documents.
+The engine owns document state and persistence. The transport provides the local HTTP/WebSocket service. The DSH adapter registers agent tools and runs the document service in a child process using the desktop runtime. This keeps editor dependencies and DOM globals out of DSH's host module loader. The browser UI and agent requests use the same Yjs documents.
 
 ## License
 
