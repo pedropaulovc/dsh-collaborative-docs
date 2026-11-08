@@ -67,6 +67,7 @@ export async function startServer(options: { dataDir: string; port?: number; sto
   const cookieName = `docs_${randomBytes(8).toString('hex')}`
   const session = randomBytes(32).toString('base64url')
   const sockets = new Map<string, Set<WebSocket>>()
+  const handshakes = new Map<string, Set<{ send(message: string): void; close(): void }>>()
   let origin = ''
   let host = ''
   const sourceDir = dirname(fileURLToPath(import.meta.url))
@@ -80,14 +81,16 @@ export async function startServer(options: { dataDir: string; port?: number; sto
     if (req.headers.origin !== undefined && req.headers.origin !== origin) throw new HttpError(403, 'Invalid Origin')
     if (req.headers['sec-fetch-site'] === 'cross-site') throw new HttpError(403, 'Cross-site requests are forbidden')
   }
-  function send(ws: WebSocket, value: unknown) {
+  function sendFrame(ws: WebSocket, message: string) {
     if (ws.readyState !== WebSocket.OPEN) return
-    if (ws.bufferedAmount > MAX_BUFFERED) { ws.close(1013, 'Client too slow'); return }
-    ws.send(JSON.stringify(value))
+    if (ws.bufferedAmount + Buffer.byteLength(message) > MAX_BUFFERED) { ws.close(1013, 'Client too slow'); return }
+    ws.send(message)
   }
+  function send(ws: WebSocket, value: unknown) { sendFrame(ws, JSON.stringify(value)) }
   const unsubscribe = store.onUpdate((id, update, revision) => {
-    const message = { type: 'update', update: Buffer.from(update).toString('base64'), revision }
-    for (const ws of sockets.get(id) ?? []) send(ws, message)
+    const message = JSON.stringify({ type: 'update', update: Buffer.from(update).toString('base64'), revision })
+    for (const ws of sockets.get(id) ?? []) sendFrame(ws, message)
+    for (const handshake of handshakes.get(id) ?? []) handshake.send(message)
   })
   const requests = new Set<Promise<void>>()
   const server = http.createServer((req, res) => {
@@ -191,30 +194,66 @@ export async function startServer(options: { dataDir: string; port?: number; sto
         const match = /^\/sync\/([0-9a-f-]+)$/.exec(new URL(req.url ?? '/', origin).pathname)
         if (!match || !UUID.test(match[1])) throw new HttpError(400, 'Invalid document ID')
         const id = match[1]
-        const state = await store.getSyncState(id)
-        wss.handleUpgrade(req, socket, head, ws => {
-          send(ws, { type: 'sync', update: Buffer.from(state.update).toString('base64'), revision: state.revision })
-          const peers = sockets.get(id) ?? new Set<WebSocket>(); sockets.set(id, peers); peers.add(ws)
-          ws.on('close', () => { peers.delete(ws); if (!peers.size) sockets.delete(id) })
-          let queue = Promise.resolve()
-          let lastSeq = -1
-          let pending = 0
-          ws.on('message', (data, binary) => {
-            if (++pending > 4) { ws.close(1008, 'Too many pending updates'); return }
-            queue = queue.then(async () => {
-              if (binary) throw new Error('Use JSON text frames')
-              const input = object(JSON.parse(data.toString()))
-              if (input.type !== 'update' || !Number.isSafeInteger(input.seq) || (input.seq as number) <= lastSeq) throw new Error('Invalid update sequence')
-              const encoded = text(input.update, 'update', MAX_FRAME - 1024)
-              if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('Invalid base64 update')
-              const update = Buffer.from(encoded, 'base64')
-              await store.applyUpdate(id, update)
-              lastSeq = input.seq as number
-              send(ws, { type: 'ack', seq: lastSeq, revision: (await store.read(id)).revision })
-            }).catch(error => { send(ws, { type: 'error', message: statusOf(error) === 500 ? 'Update rejected' : (error as Error).message }) }).finally(() => { pending-- })
+        // Subscribe before snapshot capture, without upgrading unknown documents.
+        // Capture, sync delivery, and registration otherwise have an async gap
+        // in which a durable publication can be lost forever.
+        const pending = handshakes.get(id) ?? new Set()
+        handshakes.set(id, pending)
+        const messages: string[] = []
+        let bytes = 0
+        let abandoned = false
+        const cleanup = () => {
+          pending.delete(handshake)
+          if (!pending.size && handshakes.get(id) === pending) handshakes.delete(id)
+          messages.length = 0
+          bytes = 0
+          socket.off('close', abandon)
+          socket.off('end', abandon)
+          socket.off('error', abandon)
+        }
+        const abandon = () => { abandoned = true; cleanup(); socket.destroy() }
+        const handshake = {
+          send(message: string) {
+            bytes += Buffer.byteLength(message)
+            if (bytes > MAX_BUFFERED) { abandon(); return }
+            messages.push(message)
+          },
+          close: abandon,
+        }
+        pending.add(handshake)
+        socket.once('close', abandon)
+        socket.once('end', abandon)
+        socket.once('error', abandon)
+        try {
+          const state = await store.getSyncState(id)
+          if (abandoned || socket.destroyed) return
+          wss.handleUpgrade(req, socket, head, ws => {
+            send(ws, { type: 'sync', update: Buffer.from(state.update).toString('base64'), revision: state.revision })
+            // No await: sync is first, buffered publications retain their order,
+            // and active subscription takes over before another edit can run.
+            for (const message of messages) sendFrame(ws, message)
+            const peers = sockets.get(id) ?? new Set<WebSocket>(); sockets.set(id, peers); peers.add(ws)
+            ws.on('close', () => { peers.delete(ws); if (!peers.size) sockets.delete(id) })
+            let queue = Promise.resolve()
+            let lastSeq = -1
+            let pending = 0
+            ws.on('message', (data, binary) => {
+              if (++pending > 4) { ws.close(1008, 'Too many pending updates'); return }
+              queue = queue.then(async () => {
+                if (binary) throw new Error('Use JSON text frames')
+                const input = object(JSON.parse(data.toString()))
+                if (input.type !== 'update' || !Number.isSafeInteger(input.seq) || (input.seq as number) <= lastSeq) throw new Error('Invalid update sequence')
+                const encoded = text(input.update, 'update', MAX_FRAME - 1024)
+                if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) throw new Error('Invalid base64 update')
+                const update = Buffer.from(encoded, 'base64')
+                await store.applyUpdate(id, update)
+                lastSeq = input.seq as number
+                send(ws, { type: 'ack', seq: lastSeq, revision: (await store.read(id)).revision })
+              }).catch(error => { send(ws, { type: 'error', message: statusOf(error) === 500 ? 'Update rejected' : (error as Error).message }) }).finally(() => { pending-- })
+            })
+            ws.on('error', () => { /* close event removes the socket */ })
           })
-          ws.on('error', () => { /* close event removes the socket */ })
-        })
+        } finally { cleanup() }
       } catch (error) {
         socket.end(`HTTP/1.1 ${statusOf(error)} Rejected\r\nConnection: close\r\n\r\n`)
       }
@@ -251,6 +290,7 @@ export async function startServer(options: { dataDir: string; port?: number; sto
         // Upgraded WebSockets are not covered by closeAllConnections.
         server.closeAllConnections()
         for (const peers of sockets.values()) for (const ws of peers) ws.terminate()
+        for (const pending of handshakes.values()) for (const handshake of pending) handshake.close()
         const wsClosed = Promise.withResolvers<void>()
         wss.close(() => wsClosed.resolve())
         await Promise.all([httpClosed.promise, wsClosed.promise])

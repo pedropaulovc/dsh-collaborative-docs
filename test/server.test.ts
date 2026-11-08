@@ -9,6 +9,7 @@ import * as Y from 'yjs'
 import { DefaultThreadStoreAuth } from '@blocknote/core/comments'
 import { YjsThreadStore } from '@blocknote/core/yjs'
 import { startServer } from '../src/server.js'
+import { DocumentStore } from '../src/engine.js'
 
 type Frame = { type: string; update?: string; revision?: string; seq?: number; message?: string }
 // Unlike Fetch, node:http preserves browser-supplied navigation metadata.
@@ -91,6 +92,7 @@ test('capability bootstrap, strict HTTP/WS boundaries and bounded inputs', { tim
   assert.equal(await refused(sync, origin), 403)
   assert.equal(await refused(sync, 'https://attacker.example', cookie), 403)
   assert.equal(await refused(sync, 'null', cookie), 403)
+  assert.equal(await refused(`${origin.replace('http:', 'ws:')}/sync/00000000-0000-4000-8000-000000000000`, origin, cookie), 404)
   // Neither encoded traversal nor filenames outside the public asset root are exposed.
   assert.ok([400, 404].includes((await fetch(`${origin}/%2e%2e%2fpackage.json`, { headers })).status))
   assert.equal((await fetch(`${origin}/package.json`, { headers })).status, 404)
@@ -158,6 +160,115 @@ test('durable agent broadcasts, two peer Yjs sync, stale edit rejection and rest
   assert.match(await server.store.exportMarkdown(snapshot.id), /client goodbye world/)
   assert.equal((await fetch(`${new URL(server.url).origin}/api/documents`, { headers: { Cookie: cookie } })).status, 401)
 })
+
+test('initial sync includes durable edits captured during the handshake before reporting saved', { timeout: 20_000 }, async t => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'docs-handshake-'))
+  const server = await startServer({ dataDir })
+  const release = Promise.withResolvers<void>()
+  t.after(async () => { release.resolve(); await server.close(); await rm(dataDir, { recursive: true, force: true }) })
+  const origin = new URL(server.url).origin
+  const bootstrap = await fetch(server.url, { redirect: 'manual' })
+  const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+  const created = await server.store.create({ title: 'Handshake', markdown: 'before' })
+  const captured = Promise.withResolvers<void>()
+  const getSyncState = server.store.getSyncState.bind(server.store)
+  t.mock.method(server.store, 'getSyncState', async (id: string) => {
+    const state = await getSyncState(id)
+    captured.resolve()
+    await release.promise
+    return state
+  })
+  const client = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+  const doc = new Y.Doc()
+  t.after(() => { client.ws.terminate(); doc.destroy() })
+  await captured.promise
+  // These are real persisted edits, after snapshot capture but before delivery.
+  const first = await server.store.edit(created.id, { expectedRevision: created.revision, operations: [
+    { type: 'replace_text', blockId: created.blocks[0].id, search: 'before', replacement: 'during' },
+  ] })
+  const second = await server.store.edit(created.id, { expectedRevision: first.revision, operations: [
+    { type: 'replace_text', blockId: created.blocks[0].id, search: 'during', replacement: 'after' },
+  ] })
+  release.resolve()
+  const initial = await client.next()
+  assert.equal(initial.type, 'sync', 'sync must remain the first frame')
+  assert.equal(initial.revision, created.revision, 'the barrier held the original snapshot')
+  Y.applyUpdate(doc, Buffer.from(initial.update!, 'base64'))
+  // Like the browser, merge local state on sync and wait for the durable ack.
+  // A stale initial snapshot alone must never yield a falsely "saved" client.
+  client.ws.send(JSON.stringify({ type: 'update', seq: 1, update: Buffer.from(Y.encodeStateAsUpdate(doc)).toString('base64') }))
+  const revisions: string[] = []
+  for (;;) {
+    const frame = await client.next()
+    if (frame.type === 'ack') {
+      assert.equal(frame.seq, 1)
+      assert.equal(frame.revision, second.revision)
+      break
+    }
+    assert.equal(frame.type, 'update')
+    revisions.push(frame.revision!)
+    Y.applyUpdate(doc, Buffer.from(frame.update!, 'base64'))
+  }
+  assert.match(doc.getXmlFragment('blocknote').toString(), /after/, 'client converges before saved without reconnecting')
+  assert.deepEqual(revisions.slice(0, 2), [first.revision, second.revision], 'buffered durable updates preserve publication order')
+  const durable = new Y.Doc()
+  t.after(() => durable.destroy())
+  Y.applyUpdate(durable, (await getSyncState(created.id)).update)
+  assert.equal(doc.getXmlFragment('blocknote').toString(), durable.getXmlFragment('blocknote').toString())
+  assert.equal(client.ws.readyState, WebSocket.OPEN)
+})
+
+for (const outcome of ['disconnect', 'shutdown', 'overflow'] as const) {
+  test(`pending initial sync cleans up on ${outcome}`, { timeout: 20_000 }, async t => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'docs-pending-sync-'))
+    const store = new DocumentStore(dataDir)
+    await store.init()
+    let publish!: Parameters<DocumentStore['onUpdate']>[0]
+    const subscribe = store.onUpdate.bind(store)
+    t.mock.method(store, 'onUpdate', (listener: typeof publish) => { publish = listener; return subscribe(listener) })
+    const server = await startServer({ dataDir, store })
+    const release = Promise.withResolvers<void>()
+    t.after(async () => { release.resolve(); await server.close(); await store.close(); await rm(dataDir, { recursive: true, force: true }) })
+    const origin = new URL(server.url).origin
+    const bootstrap = await fetch(server.url, { redirect: 'manual' })
+    const cookie = bootstrap.headers.get('set-cookie')!.split(';')[0]
+    const created = await store.create({ title: 'Pending', markdown: 'before' })
+    const captured = Promise.withResolvers<void>()
+    const getSyncState = store.getSyncState.bind(store)
+    const capture = t.mock.method(store, 'getSyncState', async (id: string) => {
+      const state = await getSyncState(id)
+      captured.resolve()
+      await release.promise
+      return state
+    })
+    const client = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+    t.after(() => client.ws.terminate())
+    let opened = false
+    client.ws.on('open', () => { opened = true })
+    const closed = Promise.withResolvers<void>()
+    client.ws.once('close', () => closed.resolve())
+    await captured.promise
+    if (outcome === 'disconnect') client.ws.terminate()
+    else if (outcome === 'shutdown') await server.close()
+    else {
+      // Exercise the transport's byte limit independently of the engine's own
+      // state-size limit. The convergence regression above uses durable edits.
+      const update = new Uint8Array(1024 * 1024)
+      for (let i = 0; i < 13; i++) publish(created.id, update, created.revision)
+    }
+    // Closure must not depend on the held snapshot completing.
+    await closed.promise
+    assert.equal(opened, false)
+    release.resolve()
+    capture.mock.restore()
+    if (outcome !== 'shutdown') {
+      // A new connection to the same document still receives a clean sync.
+      const retry = peer(`${origin.replace('http:', 'ws:')}/sync/${created.id}`, origin, cookie)
+      t.after(() => retry.ws.terminate())
+      assert.equal((await retry.next()).type, 'sync')
+    }
+  })
+}
 
 test('native comments merge over WebSocket and HTTP reply/resolve persist across restart', { timeout: 30_000 }, async t => {
   const dataDir = await mkdtemp(join(tmpdir(), 'docs-comments-'))
