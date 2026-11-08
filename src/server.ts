@@ -52,9 +52,26 @@ function statusOf(error: unknown) {
   return 500
 }
 
+function parentOrigin(value: string): string {
+  if (value === 'dsh-app://app') return value
+  if (typeof value !== 'string' || !/^https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]+)?\/?$/i.test(value)) throw new HttpError(400, 'Invalid local parent origin')
+  let url: URL
+  try { url = new URL(value) } catch { throw new HttpError(400, 'Invalid local parent origin') }
+  return url.origin
+}
+
+// Inspect the wire path before URL normalization can erase dot segments.
+function requestPath(req: IncomingMessage): string {
+  const raw = (req.url ?? '/').split('?')[0]
+  const decoded = decodeURIComponent(raw)
+  if (!raw.startsWith('/') || decoded.includes('\\') || decoded.includes('\0') || decoded.split('/').some(part => part === '..' || part === '.')) throw new HttpError(400, 'Invalid path')
+  return raw
+}
+
 export interface LocalDocumentServer {
   url: string
   store: DocumentStore
+  embed(parentOrigin: string): { url: string }
   close(): Promise<void>
 }
 export async function startServer(options: { dataDir: string; port?: number; store?: DocumentStore }): Promise<LocalDocumentServer> {
@@ -68,6 +85,19 @@ export async function startServer(options: { dataDir: string; port?: number; sto
   const session = randomBytes(32).toString('base64url')
   const sockets = new Map<string, Set<WebSocket>>()
   const handshakes = new Map<string, Set<{ send(message: string): void; close(): void }>>()
+  const embeds = new Map<string, string>()
+  function route(req: IncomingMessage) {
+    const pathname = requestPath(req)
+    if (pathname === '/embedded' || pathname.startsWith('/embedded/')) {
+      const match = /^\/embedded\/([A-Za-z0-9_-]{43})(\/.*)$/.exec(pathname)
+      if (!match) throw new HttpError(401, 'Invalid embed capability')
+      for (const [parent, capability] of embeds) {
+        if (same(match[1], capability)) return { pathname: match[2], parent }
+      }
+      throw new HttpError(401, 'Invalid embed capability')
+    }
+    return { pathname, parent: undefined }
+  }
   let origin = ''
   let host = ''
   const sourceDir = dirname(fileURLToPath(import.meta.url))
@@ -114,7 +144,8 @@ export async function startServer(options: { dataDir: string; port?: number; sto
     try {
       if (req.headers.host !== host) throw new HttpError(403, 'Invalid Host')
       const url = new URL(req.url ?? '/', origin)
-      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('token')) {
+      const { pathname, parent } = route(req)
+      if (!parent && req.method === 'GET' && pathname === '/' && url.searchParams.has('token')) {
         if (!same(url.searchParams.get('token') ?? '', token)) throw new HttpError(401, 'Invalid bootstrap token')
         const navigation = req.headers['sec-fetch-mode'] === 'navigate' && req.headers['sec-fetch-dest'] === 'document'
         if (!navigation) boundary(req)
@@ -132,19 +163,22 @@ export async function startServer(options: { dataDir: string; port?: number; sto
         }
         res.writeHead(303, { Location: location }); res.end(); return
       }
-      boundary(req)
-      if (!authenticated(req)) throw new HttpError(401, 'Open the authenticated editor URL first')
+      const navigation = parent && req.method === 'GET' && pathname === '/' && req.headers['sec-fetch-mode'] === 'navigate' && ['iframe', 'document'].includes(String(req.headers['sec-fetch-dest']))
+      if (navigation) {
+        if (req.headers.origin !== undefined && req.headers.origin !== parent && req.headers.origin !== origin) throw new HttpError(403, 'Invalid Origin')
+      } else boundary(req)
+      if (!parent && !authenticated(req)) throw new HttpError(401, 'Open the authenticated editor URL first')
       if (req.method === 'POST' && req.headers.origin !== origin) throw new HttpError(403, 'Origin required')
-      if (url.pathname === '/api/documents') {
+      if (pathname === '/api/documents') {
         if (req.method === 'GET') { json(await store.list()); return }
         if (req.method === 'POST') {
           const input = await body(req)
           json(await store.create({ title: text(input.title, 'title', 500), ...(input.markdown === undefined ? {} : { markdown: text(input.markdown, 'markdown') }) })); return
         }
       }
-      const route = /^\/api\/documents\/([^/]+)(?:\/(edit|markdown|comments\/([^/]+)\/(reply|resolve)))?$/.exec(url.pathname)
-      if (route) {
-        const [, id, action, encodedThread, commentAction] = route
+      const apiRoute = /^\/api\/documents\/([^/]+)(?:\/(edit|markdown|comments\/([^/]+)\/(reply|resolve)))?$/.exec(pathname)
+      if (apiRoute) {
+        const [, id, action, encodedThread, commentAction] = apiRoute
         if (!UUID.test(id)) throw new HttpError(400, 'Invalid document ID')
         if (req.method === 'GET' && !action) { json(await store.read(id)); return }
         if (req.method === 'GET' && action === 'markdown') {
@@ -169,17 +203,21 @@ export async function startServer(options: { dataDir: string; port?: number; sto
         }
         throw new HttpError(405, 'Method not allowed')
       }
-      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/sync/')) throw new HttpError(404, 'Not found')
+      if (pathname.startsWith('/api/') || pathname.startsWith('/sync/')) throw new HttpError(404, 'Not found')
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed')
-      const pathname = decodeURIComponent(url.pathname)
-      if (pathname.includes('\\') || pathname.includes('\0') || pathname.split('/').includes('..')) throw new HttpError(400, 'Invalid asset path')
-      const candidate = resolve(webRoot, `.${pathname === '/' ? '/index.html' : pathname}`)
+      const assetPath = decodeURIComponent(pathname)
+      const candidate = resolve(webRoot, `.${assetPath === '/' ? '/index.html' : assetPath}`)
       const root = await realpath(webRoot)
       let file: string
       try { file = await realpath(candidate) } catch { throw new HttpError(404, 'Asset not found; build the browser assets first') }
       if (!file.startsWith(root + sep) || !(await stat(file)).isFile() || !MIME[extname(file)]) throw new HttpError(404, 'Asset not found')
+      const content = req.method === 'HEAD' ? undefined : await readFile(file)
       res.setHeader('Content-Type', MIME[extname(file)])
-      res.end(req.method === 'HEAD' ? undefined : await readFile(file))
+      if (parent && extname(file) === '.html') {
+        res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; font-src 'self'; frame-ancestors ${parent}; base-uri 'none'; form-action 'self'`)
+        res.removeHeader('X-Frame-Options')
+      }
+      res.end(content)
     } catch (error) {
       res.statusCode = error instanceof URIError ? 400 : statusOf(error)
       json({ error: res.statusCode === 500 ? 'Internal server error' : (error as Error).message })
@@ -189,9 +227,10 @@ export async function startServer(options: { dataDir: string; port?: number; sto
   server.on('upgrade', (req, socket, head) => {
     void (async () => {
       try {
+        const { pathname, parent } = route(req)
         boundary(req)
-        if (req.headers.origin !== origin || !authenticated(req)) throw new HttpError(403, 'Unauthorized WebSocket')
-        const match = /^\/sync\/([0-9a-f-]+)$/.exec(new URL(req.url ?? '/', origin).pathname)
+        if (req.headers.origin !== origin || (!parent && !authenticated(req))) throw new HttpError(403, 'Unauthorized WebSocket')
+        const match = /^\/sync\/([0-9a-f-]+)$/.exec(pathname)
         if (!match || !UUID.test(match[1])) throw new HttpError(400, 'Invalid document ID')
         const id = match[1]
         // Subscribe before snapshot capture, without upgrading unknown documents.
@@ -281,6 +320,17 @@ export async function startServer(options: { dataDir: string; port?: number; sto
   return {
     url: `${origin}/?token=${token}`,
     store,
+    embed(value) {
+      if (closing) throw new HttpError(503, 'Document server is closing')
+      const parent = parentOrigin(value)
+      let capability = embeds.get(parent)
+      if (!capability) {
+        if (embeds.size >= 16) throw new HttpError(429, 'Too many embedded parent origins')
+        capability = randomBytes(32).toString('base64url')
+        embeds.set(parent, capability)
+      }
+      return { url: `${origin}/embedded/${capability}/` }
+    },
     close() {
       return closing ??= (async () => {
         unsubscribe()

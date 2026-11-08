@@ -7,37 +7,70 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'connection'],
       apply(ctx) {
         function DocumentsPanel() {
-          const [url, setUrl] = React.useState('')
-          const [error, setError] = React.useState('')
-          const [busy, setBusy] = React.useState(false)
-          const controller = React.useRef(null)
-          React.useEffect(() => () => controller.current?.abort(), [])
-          async function prepare() {
-            controller.current?.abort()
-            const current = new AbortController()
-            controller.current = current
-            setBusy(true)
-            setError('')
-            try {
-              const result = await ctx.connection.rpc.call('/api', 'collaborative_docs_open', {}, current.signal)
-              if (!result.ok) throw new Error(result.error.message)
-              if (!result.value || typeof result.value.url !== 'string') throw new Error('The host returned no editor URL.')
-              const target = new URL(result.value.url)
-              if (target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || !target.searchParams.get('token')) throw new Error('The host returned an invalid local editor URL.')
-              if (!current.signal.aborted) setUrl(target.href)
-            } catch (failure) {
-              if (!current.signal.aborted) setError(failure instanceof Error ? failure.message : 'Unable to start documents.')
-            } finally {
-              if (!current.signal.aborted) setBusy(false)
+          const [attempt, setAttempt] = React.useState(0)
+          const [state, setState] = React.useState({ status: 'loading', url: '', error: '' })
+          const frame = React.useRef(null)
+          React.useEffect(() => {
+            const controller = new AbortController()
+            let expectedOrigin = ''
+            let finished = false
+            setState({ status: 'loading', url: '', error: '' })
+            const fail = (message) => {
+              if (finished) return
+              finished = true
+              controller.abort()
+              clearTimeout(timer)
+              window.removeEventListener('message', onMessage)
+              setState({ status: 'error', url: '', error: message })
             }
-          }
-          return h('section', { style: { padding: '24px', maxWidth: '640px', fontFamily: 'inherit' } },
-            h('h1', null, 'Documents'),
-            h('p', null, 'Edit local documents together with the agent, including native comment threads. Documents stay on this computer.'),
-            h('button', { type: 'button', disabled: busy, onClick: prepare }, busy ? 'Starting editor…' : url ? 'Refresh editor link' : 'Prepare local editor'),
-            url && h('p', null, h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, 'Open documents in your browser')),
-            url && h('p', null, 'This private link grants access to your local documents. Do not share it.'),
-            error && h('p', { role: 'alert' }, `${error} Try preparing the editor again.`),
+            const onMessage = (event) => {
+              if (finished || !expectedOrigin || event.origin !== expectedOrigin || event.source !== frame.current?.contentWindow) return
+              if (!event.data || event.data.type !== 'dsh-collaborative-docs:ready') return
+              finished = true
+              clearTimeout(timer)
+              window.removeEventListener('message', onMessage)
+              setState((current) => ({ ...current, status: 'ready' }))
+            }
+            window.addEventListener('message', onMessage)
+            const timer = window.setTimeout(() => fail('The document editor did not finish loading. Retry to reconnect to the local server.'), 30000)
+            const start = async () => {
+              try {
+                const result = await ctx.connection.rpc.call('/api', 'collaborative_docs_embed', { parentOrigin: window.location.origin }, controller.signal)
+                if (controller.signal.aborted) return
+                if (!result.ok) throw new Error(result.error.message)
+                if (!result.value || typeof result.value.url !== 'string') throw new Error('The host returned no editor URL.')
+                const target = new URL(result.value.url)
+                if (target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || target.username || target.password || target.search || target.hash || !/^\/embedded\/[A-Za-z0-9_-]+\/$/.test(target.pathname)) throw new Error('The host returned an invalid local editor URL.')
+                expectedOrigin = target.origin
+                setState({ status: 'loading', url: target.href, error: '' })
+              } catch (failure) {
+                if (!controller.signal.aborted) fail(failure instanceof Error ? failure.message : 'Unable to start documents.')
+              }
+            }
+            void start()
+            return () => {
+              finished = true
+              controller.abort()
+              clearTimeout(timer)
+              window.removeEventListener('message', onMessage)
+            }
+          }, [attempt])
+          return h('section', { 'aria-label': 'Documents', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, width: '100%', flex: 1, fontFamily: 'inherit' } },
+            state.status === 'loading' && h('p', { role: 'status', style: { padding: '16px', margin: 0 } }, 'Loading documents…'),
+            state.status === 'error' && h('div', { role: 'alert', style: { padding: '24px' } },
+              h('h1', null, 'Documents could not load'),
+              h('p', null, state.error),
+              h('button', { type: 'button', onClick: () => setAttempt((current) => current + 1) }, 'Retry'),
+            ),
+            state.url && h('iframe', {
+              key: attempt,
+              ref: frame,
+              src: state.url,
+              title: 'Collaborative documents',
+              referrerPolicy: 'no-referrer',
+              sandbox: 'allow-scripts allow-same-origin allow-forms allow-downloads',
+              style: { display: 'block', width: '100%', height: '100%', flex: 1, minHeight: 0, border: 0 },
+            }),
           )
         }
         function DocumentsIcon({ size = 20 }) {

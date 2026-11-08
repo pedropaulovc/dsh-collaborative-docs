@@ -8,7 +8,6 @@ Requires Node.js 22 or newer. The DSH integration targets **0.2.1-rc.3**; other 
 
 ```sh
 npm ci
-npm run build
 npm run check
 npm test
 npm pack
@@ -23,12 +22,14 @@ Enable the desktop app's CLI with **Manage dsh Command**, then open a new termin
 Fully quit Desktop, then install the tarball produced by `npm pack`:
 
 ```sh
-dsh plugin --profile desktop add /absolute/path/to/pedropaulovc-dsh-collaborative-docs-0.1.0.tgz
+dsh plugin --profile desktop add /absolute/path/to/pedropaulovc-dsh-collaborative-docs-0.2.0.tgz
 ```
 
-Reopen Desktop. Open the Documents panel, or ask the agent to call `docs_open`. Do not grant a compatibility exemption to get past an unsupported runtime version.
+Reopen Desktop and select **Documents** in the sidebar. The editor loads directly inside DSH; no separate browser window or preparation step is needed. Do not grant a compatibility exemption to get past an unsupported runtime version.
 
 For the CLI web profile, use `--profile web` instead of `--profile desktop`.
+
+The embedded panel supports DSH Desktop and DSH web interfaces served from a loopback origin. The agent's `docs_open` tool still returns a standalone browser URL when needed.
 
 ## Run without DSH
 
@@ -66,7 +67,7 @@ Markdown import creates a new document. Export produces a Markdown copy; comment
 
 ## Local data and security
 
-The server listens on `127.0.0.1`. A random startup capability establishes a local session cookie. Document APIs and WebSocket upgrades require authentication and validate the host and browser origin. This is a trusted, single-user local workspace, not a multi-user authorization service.
+The server listens on `127.0.0.1`. Standalone browser access uses a random startup capability and local session cookie. The embedded sidebar uses a separate capability path for its assets, API, and WebSocket, so authentication does not depend on third-party cookies. Only its registered local DSH parent origin may frame the editor; standalone pages remain non-embeddable. Both modes validate the host and request origin. Keep capability URLs private. This is a trusted, single-user local workspace, not a multi-user authorization service.
 
 Documents persist as Yjs state under `~/.dsh/collaborative-docs` by default. Keep that directory when upgrading or uninstalling the plugin. The document API accepts Markdown text rather than arbitrary filesystem paths. The standalone server accepts `DSH_DOCS_DATA_DIR` or `--data-dir`; the plugin accepts `dataDir` and `port` configuration.
 
@@ -79,8 +80,9 @@ Saves flush the file before an atomic rename; supported platforms also flush the
 ```sh
 npm run check
 npm test
-npm run build
 ```
+
+`npm test` builds the browser assets before running the integration suite.
 
 The engine owns document state and persistence. The transport provides the local HTTP/WebSocket service. The DSH adapter registers agent tools and runs the document service in a child process using the desktop runtime. This keeps editor dependencies and DOM globals out of DSH's host module loader. The browser UI and agent requests use the same Yjs documents.
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0
+
+- Open the rich-text editor directly from the DSH Documents sidebar.
+- Authenticate embedded HTTP and WebSocket traffic without third-party cookies.
+- Restrict embedding to the registered local DSH parent while preserving standalone access controls.
+
 ## 0.1.0
 
 - Local BlockNote editor with shared Yjs documents and threaded comments.

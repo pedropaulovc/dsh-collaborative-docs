@@ -27,15 +27,15 @@ before(async () => {
 })
 after(async () => { if (root) await rm(root, { recursive: true, force: true }) })
 
-async function partialAuthenticatedPost(url: string) {
-  const bootstrap = await fetch(url, { redirect: 'manual' })
-  const cookie = bootstrap.headers.get('set-cookie')?.split(';')[0]
-  assert.ok(cookie)
-  const destination = new URL('/api/documents', url)
+async function partialAuthenticatedPost(url: string, embedded = false) {
+  const bootstrap = embedded ? undefined : await fetch(url, { redirect: 'manual' })
+  const cookie = bootstrap?.headers.get('set-cookie')?.split(';')[0]
+  if (!embedded) assert.ok(cookie)
+  const destination = new URL(embedded ? 'api/documents' : '/api/documents', url)
   const request = httpRequest(destination, {
     method: 'POST',
     headers: {
-      Cookie: cookie, Origin: destination.origin, 'Content-Type': 'application/json',
+      ...(cookie ? { Cookie: cookie } : {}), Origin: destination.origin, 'Content-Type': 'application/json',
       'Content-Length': '1024', Expect: '100-continue',
     },
   })
@@ -48,13 +48,13 @@ async function partialAuthenticatedPost(url: string) {
   return request
 }
 
-test('graceful shutdown aborts an incomplete authenticated POST and drains accepted edits', { timeout: 30_000 }, async () => {
-  const dataDir = join(root, 'partial-close')
+for (const embedded of [false, true]) test(`graceful shutdown aborts an incomplete ${embedded ? 'embedded' : 'standalone'} POST and drains accepted edits`, { timeout: 30_000 }, async () => {
+  const dataDir = join(root, `partial-close-${embedded}`)
   const service = new Service({ dataDir })
   let request
   try {
     await service.init()
-    request = await partialAuthenticatedPost((await service.open()).url)
+    request = await partialAuthenticatedPost((await (embedded ? service.embed('dsh-app://app') : service.open())).url, embedded)
     const edit = service.create({ title: 'Accepted before close', markdown: 'Durable content' })
     const started = performance.now()
     const [created] = await Promise.all([edit, service.close()])
@@ -94,11 +94,22 @@ test('child RPC preserves edits, error metadata, persistence, and host globals',
     const response = await fetch(first.url, { redirect: 'manual' })
     assert.equal(response.status, 303)
     assert.ok(response.headers.get('set-cookie'))
+    const [desktop, remount, web] = await Promise.all([service.embed('dsh-app://app'), service.embed('dsh-app://app'), service.embed('http://localhost:5173')])
+    assert.equal(desktop.url, remount.url)
+    assert.notEqual(desktop.url, web.url)
+    assert.equal(new URL(desktop.url).origin, new URL(first.url).origin, 'standalone and embedded share one lazy listener')
+    const documents = await fetch(new URL('api/documents', desktop.url))
+    assert.equal(documents.status, 200)
+    assert.equal(documents.headers.get('set-cookie'), null)
+    assert.equal((await documents.json())[0].id, created.id)
+    await assert.rejects(service.embed('https://remote.example'), (error: unknown) => error instanceof Error && 'status' in error && error.status === 400)
     assert.equal(globalThis.document, globals.document)
     assert.equal(globalThis.window, globals.window)
     await service.close()
     await service.close()
     await assert.rejects(service.list())
+    await assert.rejects(service.embed('dsh-app://app'))
+    await assert.rejects(fetch(new URL('api/documents', desktop.url)))
     const reopened = new Service({ dataDir })
     try {
       await reopened.init()
@@ -119,8 +130,8 @@ test('failed child initialization releases the process without stealing another 
   } finally { await rejected.close(); await owner.close() }
 })
 
-test('parent disconnect aborts an incomplete authenticated POST and releases the store lock', { timeout: 30_000 }, async () => {
-  const dataDir = join(root, 'orphan')
+for (const embedded of [false, true]) test(`parent disconnect aborts an incomplete ${embedded ? 'embedded' : 'standalone'} POST and releases the store lock`, { timeout: 30_000 }, async () => {
+  const dataDir = join(root, `orphan-${embedded}`)
   const child = fork(join(root, 'worker.js'), [], {
     execPath: process.execPath, execArgv: [],
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' },
@@ -134,13 +145,13 @@ test('parent disconnect aborts an incomplete authenticated POST and releases the
     const initialized = (await reply)[0] as ServiceReply
     assert.equal(initialized.ok, true)
     reply = once(child, 'message')
-    child.send({ id: 2, method: 'open', args: [] })
+    child.send({ id: 2, method: embedded ? 'embed' : 'open', args: embedded ? ['dsh-app://app'] : [] })
     const opened = (await reply)[0] as ServiceReply
     assert.ok(opened.ok)
     assert.ok(opened.value && typeof opened.value === 'object' && 'url' in opened.value)
     const { url } = opened.value
     assert.equal(typeof url, 'string')
-    request = await partialAuthenticatedPost(String(url))
+    request = await partialAuthenticatedPost(String(url), embedded)
     const started = performance.now()
     child.disconnect()
     assert.equal((await exited)[0], 0)

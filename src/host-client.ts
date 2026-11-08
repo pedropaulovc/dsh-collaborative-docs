@@ -7,6 +7,7 @@ type StoreMethod = 'list' | 'read' | 'create' | 'edit' | 'reply' | 'resolve' | '
 export type ServiceMethods = Pick<DocumentStore, StoreMethod> & {
   init(config: ServiceConfig): Promise<void>
   open(id?: string): Promise<{ url: string }>
+  embed(parentOrigin: string): Promise<{ url: string }>
   close(): Promise<void>
 }
 export type ServiceRequest = { [K in keyof ServiceMethods]: { id: number; method: K; args: Parameters<ServiceMethods[K]> } }[keyof ServiceMethods]
@@ -88,6 +89,7 @@ export class DocumentService {
   resolve(...args: Parameters<ServiceMethods['resolve']>) { return this.request('resolve', ...args) }
   exportMarkdown(...args: Parameters<ServiceMethods['exportMarkdown']>) { return this.request('exportMarkdown', ...args) }
   open(...args: Parameters<ServiceMethods['open']>) { return this.request('open', ...args) }
+  embed(...args: Parameters<ServiceMethods['embed']>) { return this.request('embed', ...args) }
 
   close(): Promise<void> {
     return this.closing ??= (async () => {

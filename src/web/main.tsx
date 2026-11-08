@@ -9,6 +9,7 @@ import { BlockNoteView } from '@blocknote/mantine';
 import { BlockNoteViewEditor, ComponentsContext, ThreadsSidebar, useComponentsContext, useCreateBlockNote } from '@blocknote/react';
 import type { ComponentProps as BlockNoteComponentProps } from '@blocknote/react';
 import { DocumentSync } from './sync.js';
+import { workspaceUrl } from './urls.js';
 import '@blocknote/mantine/style.css';
 import './app.css';
 
@@ -16,7 +17,7 @@ type DocumentInfo = { id: string; title: string; updatedAt: string };
 type Session = { info: DocumentInfo; sync: DocumentSync };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, { ...init, credentials: 'same-origin' });
+  const response = await fetch(workspaceUrl(path), { ...init, credentials: 'same-origin' });
   if (!response.ok) {
     let message = `Request failed (${response.status}).`;
     try {
@@ -163,6 +164,10 @@ function OpenDocument({ session, userId }: { session: Session; userId: string })
 }
 
 function App() {
+  useEffect(() => {
+    // This message contains no capability, document data or other secrets.
+    if (window.parent !== window) window.parent.postMessage({ type: 'dsh-collaborative-docs:ready' }, '*');
+  }, []);
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [selected, setSelected] = useState<string | null>(new URL(location.href).searchParams.get('document'));
   const [loading, setLoading] = useState(true);
@@ -188,7 +193,7 @@ function App() {
   const loadDocuments = async () => {
     setLoading(true);
     setError(null);
-    try { setDocuments(await request<DocumentInfo[]>('/api/documents')); }
+    try { setDocuments(await request<DocumentInfo[]>('api/documents')); }
     catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not load documents.'); }
     finally { setLoading(false); }
   };
@@ -213,7 +218,7 @@ function App() {
     if (!selected || sessions.has(selected)) return;
     let cancelled = false;
     setError(null);
-    request<DocumentInfo>(`/api/documents/${encodeURIComponent(selected)}`).then((info) => {
+    request<DocumentInfo>(`api/documents/${encodeURIComponent(selected)}`).then((info) => {
       if (cancelled) return;
       const next = new Map(sessionsRef.current);
       next.set(info.id, { info, sync: new DocumentSync(info.id) });
@@ -238,7 +243,7 @@ function App() {
   };
   const selectedSession = selected ? sessions.get(selected) : undefined;
   return <div className="workspace">
-    <header className="workspace-bar"><a className="workspace-name" href="/">Documents<span>Local collaborative workspace</span></a>
+    <header className="workspace-bar"><a className="workspace-name" href={workspaceUrl().href}>Documents<span>Local collaborative workspace</span></a>
       <div className="workspace-actions"><label className="document-picker"><span className="visually-hidden">Select document</span><select value={selected ?? ''} onFocus={() => { if (!loading) void loadDocuments(); }} onChange={(event) => choose(event.target.value)}><option value="">Choose a document</option>{documents.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
       <button type="button" onClick={() => { setTitle(''); setImported(null); setDialog(true); }}>New document</button>
       <button type="button" onClick={() => importInput.current?.click()}>Import Markdown</button>
@@ -247,7 +252,7 @@ function App() {
         if (selectedSession.sync.getSnapshot().persistence === 'pending') { setError('Wait for all changes to be saved before exporting. Reconnect to save offline edits.'); return; }
         setExporting(true); setError(null);
         try {
-          const response = await fetch(`/api/documents/${encodeURIComponent(selectedSession.info.id)}/markdown`);
+          const response = await fetch(workspaceUrl(`api/documents/${encodeURIComponent(selectedSession.info.id)}/markdown`));
           if (!response.ok) throw new Error(`Export failed (${response.status}). Reopen from DSH if your session expired.`);
           const blob = new Blob([await response.text()], { type: 'text/markdown;charset=utf-8' });
           const url = URL.createObjectURL(blob);
@@ -286,7 +291,7 @@ function App() {
       event.preventDefault(); if (!title.trim() || creating) return;
       setCreating(true); setError(null);
       try {
-        const info = await request<DocumentInfo>('/api/documents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim(), ...(imported ? { markdown: imported.markdown } : {}) }) });
+        const info = await request<DocumentInfo>('api/documents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: title.trim(), ...(imported ? { markdown: imported.markdown } : {}) }) });
         setDocuments((items) => [...items, info]); setDialog(false); setImported(null); choose(info.id);
       } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not create document.'); }
       finally { setCreating(false); }
